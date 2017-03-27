@@ -29,6 +29,11 @@
 #include <asm/opal.h>
 #include <asm/smp.h>
 
+static bool in_realmode(void)
+{
+	return !(mfmsr() & MSR_IR);
+}
+
 #define KVM_CMA_CHUNK_ORDER	18
 
 /*
@@ -225,10 +230,13 @@ void kvmhv_rm_send_ipi(int cpu)
 
 	/* Else poke the target with an IPI */
 	xics_phys = paca[cpu].kvm_hstate.xics_phys;
-	if (xics_phys)
+	if (!in_realmode())
+		opal_int_set_mfrr(get_hard_smp_processor_id(cpu), IPI_PRIORITY);
+	else if (xics_phys)
 		rm_writeb(xics_phys + XICS_MFRR, IPI_PRIORITY);
 	else
-		opal_int_set_mfrr(get_hard_smp_processor_id(cpu), IPI_PRIORITY);
+		opal_rm_int_set_mfrr(get_hard_smp_processor_id(cpu),
+				     IPI_PRIORITY);
 }
 
 /*
@@ -411,8 +419,10 @@ static long kvmppc_read_one_intr(bool *again)
 	/* Now read the interrupt from the ICP */
 	xics_phys = local_paca->kvm_hstate.xics_phys;
 	rc = 0;
-	if (!xics_phys)
+	if (!in_realmode())
 		rc = opal_int_get_xirr(&xirr, false);
+	else if (!xics_phys)
+		rc = opal_rm_int_get_xirr(&xirr, false);
 	else
 		xirr = _lwzcix(xics_phys + XICS_XIRR);
 	if (rc < 0)
@@ -443,12 +453,15 @@ static long kvmppc_read_one_intr(bool *again)
 	 */
 	if (xisr == XICS_IPI) {
 		rc = 0;
-		if (xics_phys) {
+		if (!in_realmode()) {
+			opal_int_set_mfrr(hard_smp_processor_id(), 0xff);
+			rc = opal_int_eoi(h_xirr);
+		} else if (xics_phys) {
 			_stbcix(xics_phys + XICS_MFRR, 0xff);
 			_stwcix(xics_phys + XICS_XIRR, xirr);
 		} else {
-			opal_int_set_mfrr(hard_smp_processor_id(), 0xff);
-			rc = opal_int_eoi(h_xirr);
+			opal_rm_int_set_mfrr(hard_smp_processor_id(), 0xff);
+			rc = opal_rm_int_eoi(h_xirr);
 		}
 		/* If rc > 0, there is another interrupt pending */
 		*again = rc > 0;
@@ -469,11 +482,14 @@ static long kvmppc_read_one_intr(bool *again)
 			/* We raced with the host,
 			 * we need to resend that IPI, bummer
 			 */
-			if (xics_phys)
-				_stbcix(xics_phys + XICS_MFRR, IPI_PRIORITY);
-			else
+			if (!in_realmode())
 				opal_int_set_mfrr(hard_smp_processor_id(),
 						  IPI_PRIORITY);
+			else if (xics_phys)
+				_stbcix(xics_phys + XICS_MFRR, IPI_PRIORITY);
+			else
+				opal_rm_int_set_mfrr(hard_smp_processor_id(),
+						     IPI_PRIORITY);
 			/* Let side effects complete */
 			smp_mb();
 			return 1;
